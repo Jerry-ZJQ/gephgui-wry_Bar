@@ -36,6 +36,7 @@ tao = "0.31.1"
 rfd = { version = "=0.15.0", default-features = false, features = [
     "xdg-portal",
     "async-std",
+    "common-controls-v6",
 ] }
 async-trait = "0.1.89"
 tray-icon = "0.24"
