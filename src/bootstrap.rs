@@ -22,11 +22,11 @@
 //! (boot-triggered, SYSTEM), so normally the manager is up before any user logs in.
 //! But AV / "PC cleaner" tools sometimes delete autostart scheduled tasks outright;
 //! without a repair path that breaks Geph permanently until a reinstall. When the
-//! manager doesn't answer (after a short grace period for boot races), we run the
-//! same orchestration with UAC in place of pkexec: explain → `ShellExecuteExW`
-//! ("runas") on the sibling `geph5.exe register-manager` → wait for the named pipe
-//! to answer. Since the GUI autostarts at every logon ({commonstartup} shortcut in
-//! setup.iss), this heals a deleted task at the next logon or app launch.
+//! manager pipe definitively fails, we run the same orchestration with UAC in place
+//! of pkexec: explain → `ShellExecuteExW` ("runas") on the sibling
+//! `geph5.exe register-manager` → wait for the named pipe to answer. Since the GUI
+//! autostarts at every logon ({commonstartup} shortcut in setup.iss), this heals a
+//! deleted task at the next logon or app launch.
 //!
 //! The orchestration (detect → dialog → elevate → result) is generic; only the
 //! command wrapping and the post-install relaunch differ between native and Flatpak.
@@ -65,14 +65,6 @@ fn ensure_manager_windows() -> bool {
     if reachable() {
         return true;
     }
-    // Not answering. This might just be a race with the boot-triggered manager task
-    // still starting up, so poll for a few seconds before bothering the user.
-    for _ in 0..20 {
-        std::thread::sleep(Duration::from_millis(250));
-        if reachable() {
-            return true;
-        }
-    }
 
     if !explain_dialog() {
         return false; // user chose Quit
@@ -90,13 +82,11 @@ fn ensure_manager_windows() -> bool {
         }
     }
 
-    // Wait briefly for the (re)registered manager to bind its named pipe, then
-    // continue either way; the GUI surfaces its own "can't reach manager" error.
-    for _ in 0..40 {
-        if reachable() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(250));
+    // The manager binds its named pipe before initializing children or touching
+    // the network. Wait for that concrete state transition rather than turning
+    // an arbitrary elapsed duration into another "manager is dead" result.
+    while !reachable() {
+        std::thread::sleep(Duration::from_millis(50));
     }
     true
 }
@@ -240,21 +230,12 @@ fn ensure_manager_linux() -> bool {
         return false;
     }
 
-    // Native install, or a Flatpak in-place upgrade (the dir was already mounted):
-    // wait briefly for the (re)started manager to bind its socket, then continue.
-    for _ in 0..40 {
-        if reachable() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(250));
+    // Native install, or a Flatpak in-place upgrade where the runtime directory
+    // is already mounted: wait for the concrete control-socket transition. The
+    // manager binds it before child initialization or network work.
+    while !reachable() {
+        std::thread::sleep(Duration::from_millis(50));
     }
-    if is_flatpak {
-        if !auto_relaunch() {
-            relaunch_dialog();
-        }
-        return false;
-    }
-    // Native: continue anyway; the GUI surfaces its own "can't reach manager" error.
     true
 }
 

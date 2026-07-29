@@ -13,14 +13,12 @@
 //! `geph5_misc_rpc::manager_control` — the same definitions the manager and the
 //! `geph` CLI compile against, so the endpoint and the wire types cannot drift.
 
-use std::{future::Future, sync::LazyLock, time::Duration};
+use std::{future::Future, sync::LazyLock};
 
-use anyhow::Context;
 use geph5_broker_protocol::ExitConstraint;
 use geph5_misc_rpc::manager_control::{
     self, GephCtlClient, GephCtlError, SessionContext, TunnelSettings,
 };
-use geph5_rt::TimeoutExt;
 use isocountry::CountryCode;
 use nanorpc::{JrpcRequest, JrpcResponse, RpcTransport};
 use serde_json::{Value, json};
@@ -35,16 +33,12 @@ fn client() -> &'static GephCtlClient {
     &CLIENT
 }
 
-/// Await a `GephCtl` call with a timeout, flattening the transport and
-/// application error layers into one `anyhow` error.
+/// Await a `GephCtl` call, flattening the transport and application error
+/// layers into one `anyhow` error.
 async fn ctl<T>(
     fut: impl Future<Output = Result<Result<T, String>, GephCtlError<anyhow::Error>>>,
 ) -> anyhow::Result<T> {
-    match fut
-        .timeout(Duration::from_secs(60))
-        .await
-        .context("geph manager call timed out")?
-    {
+    match fut.await {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(msg)) => Err(anyhow::anyhow!(msg)),
         Err(e) => Err(anyhow::anyhow!("could not reach the geph manager: {e:?}")),
@@ -141,20 +135,31 @@ pub async fn set_exit_constraint(exit: &crate::rpc::ExitConstraint) -> anyhow::R
 }
 
 /// Whether the manager's control endpoint is up and answering at all (regardless
-/// of connection state). Used by the startup bootstrap to decide whether the host
-/// manager needs to be installed/started. Short timeout: this is polled.
+/// of connection state). The raw `ping` call is intentionally lock-free in the
+/// manager and never reaches an engine or the network. We do not turn elapsed
+/// time into a false "dead" result: only a definite transport/RPC failure does.
 #[cfg(any(unix, windows))]
 pub async fn manager_reachable() -> bool {
-    (client().get_settings().timeout(Duration::from_secs(2)).await)
-        .is_some_and(|r| matches!(r, Ok(Ok(_))))
+    let req = JrpcRequest {
+        jsonrpc: "2.0".into(),
+        method: "ping".into(),
+        params: vec![],
+        id: nanorpc::JrpcId::Number(0),
+    };
+    match manager_control::manager_control_transport()
+        .call_raw(req)
+        .await
+    {
+        Ok(resp) => resp.error.is_none(),
+        Err(_) => false,
+    }
 }
 
 /// Whether the user currently wants the tunnel up (mirrors the old "is the
 /// manager process running" semantics, which only existed while connected).
-/// Short timeout: the tray polls this once a second.
 pub async fn manager_connected() -> bool {
-    match client().get_settings().timeout(Duration::from_secs(2)).await {
-        Some(Ok(Ok(settings))) => settings.connected,
+    match client().get_settings().await {
+        Ok(Ok(settings)) => settings.connected,
         _ => false,
     }
 }
@@ -172,9 +177,7 @@ pub async fn daemon_rpc(inner: JrpcRequest) -> anyhow::Result<JrpcResponse> {
     };
     let mut resp = manager_control::manager_control_transport()
         .call_raw(req)
-        .timeout(Duration::from_secs(10))
-        .await
-        .context("daemon_rpc timed out")??;
+        .await?;
     // The manager's `daemon_rpc` result/error already reflects the inner call.
     resp.id = inner.id;
     Ok(resp)
